@@ -65,48 +65,73 @@ async def main():
             exclude_managed_identity_credential=True) as creds,
         AzureAIAgent.create_client(credential=creds) as client,
     ):
-    
         # Create the incident manager agent on the Azure AI agent service
-
+        incident_agent_definition = await client.agents.create_agent(
+            model=ai_agent_settings.model_deployment_name,
+            name=INCIDENT_MANAGER,
+            instructions=INCIDENT_MANAGER_INSTRUCTIONS
+        )
 
         # Create a Semantic Kernel agent for the Azure AI incident manager agent
-
+        agent_incident = AzureAIAgent(
+            client=client,
+            definition=incident_agent_definition,
+            plugins=[LogFilePlugin()]
+        )
 
         # Create the devops agent on the Azure AI agent service
-
+        devops_agent_definition = await client.agents.create_agent(
+            model=ai_agent_settings.model_deployment_name,
+            name=DEVOPS_ASSISTANT,
+            instructions=DEVOPS_ASSISTANT_INSTRUCTIONS,
+        )
 
         # Create a Semantic Kernel agent for the devops Azure AI agent
-
+        agent_devops = AzureAIAgent(
+            client=client,
+            definition=devops_agent_definition,
+            plugins=[DevopsPlugin()]
+        )
 
         # Add the agents to a group chat with a custom termination and selection strategy
-        
+        chat = AgentGroupChat(
+            agents=[agent_incident, agent_devops],
+            termination_strategy=ApprovalTerminationStrategy(
+                agents=[agent_incident], 
+                maximum_iterations=10, 
+                automatic_reset=True
+            ),
+            selection_strategy=SelectionStrategy(agents=[agent_incident,agent_devops]),      
+        )        
 
-         # Process log files
+        # Process log files
         for filename in os.listdir(file_path):
             logfile_msg = ChatMessageContent(role=AuthorRole.USER, content=f"USER > {file_path}/{filename}")
             await asyncio.sleep(30) # Wait to reduce TPM
             print(f"\nReady to process log file: {filename}\n")
 
-
             # Append the current log file to the chat
-
+            await chat.add_chat_message(logfile_msg)
+            print()
 
             try:
                 print()
 
                 # Invoke a response from the agents
+                async for response in chat.invoke():
+                    if response is None or not response.name:
+                        continue
+                    print(f"{response.content}")
 
-                
             except Exception as e:
                 print(f"Error during chat invocation: {e}")
                 # If TPM rate exceeded, wait 60 secs
                 if "Rate limit is exceeded" in str(e):
-                    print ("Waiting...")
+                    print("Waiting...")
                     await asyncio.sleep(60)
                     continue
                 else:
                     break
-
 
 
 # class for selection strategy
@@ -114,7 +139,16 @@ class SelectionStrategy(SequentialSelectionStrategy):
     """A strategy for determining which agent should take the next turn in the chat."""
     
     # Select the next agent that should take the next turn in the chat
-
+    async def select_agent(self, agents, history):
+        """Check which agent should take the next turn in the chat."""
+    
+        # The Incident Manager should go after the User or the Devops Assistant
+        if (history[-1].name == DEVOPS_ASSISTANT or history[-1].role == AuthorRole.USER):
+            agent_name = INCIDENT_MANAGER
+            return next((agent for agent in agents if agent.name == agent_name), None)
+        
+        # Otherwise it is the Devops Assistant's turn
+        return next((agent for agent in agents if agent.name == DEVOPS_ASSISTANT), None)
 
 
 # class for temination strategy
@@ -122,8 +156,9 @@ class ApprovalTerminationStrategy(TerminationStrategy):
     """A strategy for determining when an agent should terminate."""
 
     # End the chat if the agent has indicated there is no action needed
-
-
+    async def should_agent_terminate(self, agent, history):
+        """Check if the agent should terminate."""
+        return "no action needed" in history[-1].content.lower()
 
 
 # class for DevOps functions
